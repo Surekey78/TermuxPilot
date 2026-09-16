@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -36,16 +37,19 @@ class AuditLog:
             pass  # never block the agent on audit bookkeeping
 
     def tail(self, n: int = 10) -> list[dict[str, Any]]:
-        if not self.path.exists():
+        if n <= 0 or not self.path.exists():
             return []
         try:
-            lines = self.path.read_text(encoding="utf-8").strip().splitlines()
+            with self.path.open(encoding="utf-8", errors="replace") as stream:
+                lines = deque(stream, maxlen=n)
         except OSError:
             return []
         out = []
-        for line in lines[-n:]:
+        for line in lines:
             try:
-                out.append(json.loads(line))
+                entry = json.loads(line)
+                if isinstance(entry, dict):
+                    out.append(entry)
             except json.JSONDecodeError:
                 continue
         return out

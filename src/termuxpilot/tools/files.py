@@ -8,10 +8,15 @@ are escalated to "high" risk by the router via ``ExecutionContext.guard_path``.
 from __future__ import annotations
 
 import difflib
+import os
 import shutil
+import stat
+import tempfile
+from contextlib import contextmanager
+from itertools import islice
 from pathlib import Path
 
-from ..safety import RiskAssessment
+from ..safety import LineRedactor, RiskAssessment, redact_secrets
 from .base import (
     ExecutionContext,
     READ,
@@ -23,31 +28,90 @@ from .base import (
     expand,
     truncate_output,
 )
+from .output import BoundedText
 
 MAX_READ_BYTES = 1_000_000
+MAX_LINE_BYTES = 65_536
+MAX_READ_LINES = 10_000
+DEFAULT_WINDOW_LINES = 200
 PREVIEW_MAX_LINES = 200
 
 
+@contextmanager
+def _open_regular(path: Path):
+    # O_NONBLOCK prevents a FIFO from hanging before we can inspect fstat.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"not a regular file: {path}")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            yield stream
+    finally:
+        os.close(fd)
+
+
 def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="replace")
+    """Bound previews, edits and diffs too, not just read_file results."""
+    with _open_regular(path) as stream:
+        data = stream.read(MAX_READ_BYTES + 1)
+    if len(data) > MAX_READ_BYTES:
+        raise ValueError(f"file too large for an in-memory edit/diff: {path}; use a streaming shell tool")
+    return data.decode("utf-8", errors="replace")
+
+
+def _snapshot(path: Path) -> tuple:
+    resolved = path.resolve()
+    try:
+        info = resolved.stat()
+    except FileNotFoundError:
+        return (str(resolved), None)
+    return (str(resolved), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode)
+
+
+def _atomic_write(path: Path, content: str, expected: tuple) -> None:
+    """Same-directory replace; detected changes since approval fail closed.
+
+    This protects against torn writes, not arbitrary concurrent writers: a
+    filesystem does not provide compare-and-swap for the final rename.
+    """
+    if _snapshot(path) != expected:
+        raise ValueError("file changed since preview; read it again before writing")
+    target = path.resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.tp-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            if expected[1] is not None:
+                os.fchmod(stream.fileno(), stat.S_IMODE(expected[-1]))
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if _snapshot(path) != expected:
+            raise ValueError("file changed since preview; read it again before writing")
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _diff_label(prefix: str, path: str) -> str:
     return f"{prefix}{path}" if path.startswith("/") else f"{prefix}/{path}"
 
 
-def _unified_diff(old: str, new: str, label_old: str, label_new: str) -> str:
+def _unified_diff(old: str, new: str, label_old: str, label_new: str, *, redact: bool = False) -> str:
+    if redact:
+        changed = old != new
+        old, new = redact_secrets(old), redact_secrets(new)
+        if changed and old == new:
+            return "(redacted content changes; sensitive values hidden)"
     diff = difflib.unified_diff(
         old.splitlines(keepends=True),
         new.splitlines(keepends=True),
         fromfile=label_old,
         tofile=label_new,
     )
-    lines = list(diff)
+    lines = list(islice(diff, PREVIEW_MAX_LINES + 1))
     if len(lines) > PREVIEW_MAX_LINES:
-        lines = lines[:PREVIEW_MAX_LINES] + [
-            f"... [diff truncated, {len(lines) - PREVIEW_MAX_LINES} more lines] ..."
-        ]
+        lines = lines[:PREVIEW_MAX_LINES] + ["\n... [diff truncated; more lines omitted] ...\n"]
     return "".join(lines) or "(no changes)"
 
 
@@ -65,23 +129,63 @@ def _run_read(request: ToolRequest, ctx: ExecutionContext) -> ToolResult:
     path = expand(request.args.get("path"))
     if not path.exists():
         return ToolResult(ok=False, output=f"no such file: {path}")
-    if path.stat().st_size > MAX_READ_BYTES:
-        return ToolResult(
-            ok=False,
-            output=f"file too large to read in one go ({path.stat().st_size:,} bytes); "
-            "use start_line/end_line or split it up",
-        )
-    text = _read_text(path)
-    start = request.args.get("start_line")
+    start = request.args.get("start_line", 1)
     end = request.args.get("end_line")
-    lines = text.splitlines()
-    total = len(lines)
-    lo = int(start) - 1 if start else 0
-    hi = int(end) if end else total
-    selected = lines[lo:hi]
-    numbered = "\n".join(f"{i + lo + 1:>6}\t{line}" for i, line in enumerate(selected))
-    note = f"[{path} — lines {lo + 1}-{min(hi, total)} of {total}]\n"
-    return ToolResult(ok=True, output=truncate_output(note + numbered))
+    windowed = "start_line" in request.args or "end_line" in request.args
+    if end is not None and end < start:
+        return ToolResult(ok=False, output="end_line must be >= start_line")
+    if end is not None and end - start + 1 > MAX_READ_LINES:
+        return ToolResult(ok=False, output=f"request at most {MAX_READ_LINES:,} lines per window")
+    if end is None:
+        end = start + (DEFAULT_WINDOW_LINES if windowed else MAX_READ_LINES) - 1
+
+    output = BoundedText(ctx.max_output_chars)
+    redactor = LineRedactor() if ctx.redact_secrets else None
+    line_no = last = selected_bytes = 0
+    limited = False
+    with _open_regular(path) as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if size > MAX_READ_BYTES and not windowed:
+            return ToolResult(ok=False, output=(
+                f"file too large to read in one go ({size:,} bytes); "
+                "request a start_line/end_line window"
+            ))
+        while line_no < end:
+            raw = stream.readline(MAX_LINE_BYTES + 1)
+            if not raw:
+                break
+            line_no += 1
+            if len(raw) > MAX_LINE_BYTES:
+                return ToolResult(ok=False, output=(
+                    f"line {line_no} exceeds {MAX_LINE_BYTES:,} bytes; "
+                    "use a bounded byte-processing shell command instead"
+                ))
+            text = raw.decode("utf-8", errors="replace")
+            # Observe skipped lines too, so a requested window inside a PEM
+            # private-key block does not disclose its body.
+            if redactor:
+                text = redactor.redact(text)
+            if line_no < start:
+                continue
+            if selected_bytes + len(raw) > MAX_READ_BYTES:
+                limited = True
+                break
+            selected_bytes += len(raw)
+            last = line_no
+            if text:
+                output.append(f"{line_no:>6}\t{text.rstrip(chr(10)).rstrip(chr(13))}\n")
+        more = stream.tell() < size or limited
+
+    if not last:
+        if line_no == 0:
+            return ToolResult(ok=True, output=f"[{path} — empty file]")
+        return ToolResult(ok=False, output=f"start_line {start} is beyond end of file ({line_no} lines)")
+    limited = limited or (not windowed and more)
+    total = f" of {last}" if not more else ""
+    note = f"[{path} — lines {start}-{last}{total}]\n"
+    if limited:
+        note += f"[read limit reached; continue with start_line={last + 1}]\n"
+    return ToolResult(ok=True, output=note + output.text(), truncated=limited or output.truncated)
 
 
 def build_read_tool() -> Tool:
@@ -89,17 +193,19 @@ def build_read_tool() -> Tool:
         name="read_file",
         description=(
             "Read a text file. Returns numbered lines. Optional 1-based "
-            "start_line/end_line window for large files. Binary files are read "
-            "as replacement text — prefer run_shell (hexdump) for binaries."
+            "start_line/end_line window works even for large files. start_line "
+            "alone reads up to 200 lines. Each read is bounded to 1 MB / 10,000 "
+            "lines; lines over 64 KiB and non-regular files are rejected."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "path": {"type": "string", "minLength": 1},
                 "start_line": {"type": "integer", "minimum": 1},
                 "end_line": {"type": "integer", "minimum": 1},
             },
             "required": ["path"],
+            "additionalProperties": False,
         },
         category=READ,
         handler=_run_read,
@@ -119,18 +225,22 @@ def _write_preview(request: ToolRequest, ctx: ExecutionContext) -> tuple[RiskAss
     protected = ctx.guard_path(str(path))
     if protected:
         risk.escalate("high", f"target is inside protected path {protected}")
+    if len(content.encode("utf-8")) > MAX_READ_BYTES:
+        raise ValueError("content exceeds the 1 MB text-write limit")
+    request.state["snapshot"] = _snapshot(path)
     if path.exists():
-        diff = _unified_diff(_read_text(path), content, _diff_label("a", str(path)), _diff_label("b", str(path)))
+        diff = _unified_diff(_read_text(path), content, _diff_label("a", str(path)),
+                             _diff_label("b", str(path)), redact=ctx.redact_secrets)
     else:
-        diff = _unified_diff("", content, "/dev/null", _diff_label("b", str(path)))
+        diff = _unified_diff("", content, "/dev/null", _diff_label("b", str(path)),
+                             redact=ctx.redact_secrets)
     return risk, f"write {path}\n{diff}"
 
 
 def _run_write(request: ToolRequest, ctx: ExecutionContext) -> ToolResult:
     path = expand(request.args.get("path"))
     content = ensure_str(request.args.get("content"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    _atomic_write(path, content, request.state["snapshot"])
     return ToolResult(ok=True, output=f"wrote {len(content):,} chars to {path}")
 
 
@@ -145,10 +255,11 @@ def build_write_tool() -> Tool:
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string", "description": "Full new file content."},
+                "path": {"type": "string", "minLength": 1},
+                "content": {"type": "string", "maxLength": MAX_READ_BYTES, "description": "Full new file content (up to 1 MB UTF-8)."},
             },
             "required": ["path", "content"],
+            "additionalProperties": False,
         },
         category=WRITE,
         handler=_run_write,
@@ -171,9 +282,13 @@ def _preview_edit(request: ToolRequest, ctx: ExecutionContext) -> tuple[RiskAsse
         risk.escalate("high", f"target is inside protected path {protected}")
     if not path.exists():
         return risk, f"edit {path} (file does not exist)"
+    request.state["snapshot"] = _snapshot(path)
     current = _read_text(path)
     updated = current.replace(old_text, new_text, 1)
-    diff = _unified_diff(current, updated, _diff_label("a", str(path)), _diff_label("b", str(path)))
+    if len(updated.encode("utf-8")) > MAX_READ_BYTES:
+        raise ValueError("edited content exceeds the 1 MB text-write limit")
+    diff = _unified_diff(current, updated, _diff_label("a", str(path)),
+                         _diff_label("b", str(path)), redact=ctx.redact_secrets)
     return risk, f"edit {path}\n{diff}"
 
 
@@ -199,7 +314,7 @@ def _run_edit(request: ToolRequest, ctx: ExecutionContext) -> ToolResult:
             output=f"old_text matches {count} places in the file — include more "
             "surrounding context to make it unique",
         )
-    path.write_text(current.replace(old_text, new_text, 1), encoding="utf-8")
+    _atomic_write(path, current.replace(old_text, new_text, 1), request.state["snapshot"])
     return ToolResult(ok=True, output=f"edited {path} (1 replacement)")
 
 
@@ -214,11 +329,12 @@ def build_edit_tool() -> Tool:
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "old_text": {"type": "string", "description": "Exact text to find (must be unique)."},
+                "path": {"type": "string", "minLength": 1},
+                "old_text": {"type": "string", "minLength": 1, "description": "Exact text to find (must be unique)."},
                 "new_text": {"type": "string", "description": "Replacement text."},
             },
             "required": ["path", "old_text", "new_text"],
+            "additionalProperties": False,
         },
         category=WRITE,
         handler=_run_edit,
@@ -270,11 +386,12 @@ def build_move_tool() -> Tool:
         parameters={
             "type": "object",
             "properties": {
-                "src": {"type": "string"},
-                "dst": {"type": "string"},
+                "src": {"type": "string", "minLength": 1},
+                "dst": {"type": "string", "minLength": 1},
                 "overwrite": {"type": "boolean"},
             },
             "required": ["src", "dst"],
+            "additionalProperties": False,
         },
         category=WRITE,
         handler=_run_move,
@@ -304,7 +421,8 @@ def _run_diff(request: ToolRequest, ctx: ExecutionContext) -> ToolResult:
     text_b = _read_text(b)
     if text_a == text_b:
         return ToolResult(ok=True, output="files are identical")
-    diff = _unified_diff(text_a, text_b, _diff_label("a", str(a)), _diff_label("b", str(b)))
+    diff = _unified_diff(text_a, text_b, _diff_label("a", str(a)),
+                         _diff_label("b", str(b)), redact=ctx.redact_secrets)
     return ToolResult(ok=True, output=truncate_output(diff))
 
 
@@ -315,10 +433,11 @@ def build_diff_tool() -> Tool:
         parameters={
             "type": "object",
             "properties": {
-                "a": {"type": "string"},
-                "b": {"type": "string"},
+                "a": {"type": "string", "minLength": 1},
+                "b": {"type": "string", "minLength": 1},
             },
             "required": ["a", "b"],
+            "additionalProperties": False,
         },
         category=READ,
         handler=_run_diff,

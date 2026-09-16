@@ -294,3 +294,52 @@ def test_sample_config_round_trips(tmp_path, monkeypatch):
     with pytest.raises(ConfigError, match="already exists"):
         write_sample_config(path)
     write_sample_config(path, force=True)
+
+
+@pytest.mark.parametrize("block,key", [
+    ("tools:\n  shell:\n    timeout: .nan\n", "timeout"),
+    ("tools:\n  shell:\n    timeout: .inf\n", "timeout"),
+    ("tools:\n  shell:\n    timeout: true\n", "timeout"),
+    ("tools:\n  shell:\n    max_timeout: 0\n", "max_timeout"),
+    ("tools:\n  shell:\n    timeout: 10\n    max_timeout: 5\n", "max_timeout"),
+    ("tools:\n  shell:\n    kill_grace: -1\n", "kill_grace"),
+    ("tools:\n  shell:\n    kill_grace: 31\n", "kill_grace"),
+    ("tools:\n  max_output_chars: 127\n", "max_output_chars"),
+    ("tools:\n  max_output_chars: 1000001\n", "max_output_chars"),
+    ("tools:\n  max_output_chars: true\n", "max_output_chars"),
+    ("agent:\n  max_tool_rounds: true\n", "max_tool_rounds"),
+    ("agent:\n  max_tool_calls: 0\n", "max_tool_calls"),
+    ("agent:\n  max_context_chars: -1\n", "max_context_chars"),
+])
+def test_invalid_runtime_limits_raise_config_error(write_config, block, key):
+    with pytest.raises(ConfigError, match=key):
+        load_config(write_config("provider:\n  base_url: https://example.test/v1\n  model: m\n" + block))
+
+
+def test_runtime_limits_are_loaded_and_wired_to_session(write_config):
+    from termuxpilot.cli import build_session
+    from termuxpilot.provider import ProviderChain
+
+    cfg = load_config(write_config(
+        "provider:\n  base_url: https://example.test/v1\n  model: m\n"
+        "tools:\n  max_output_chars: 8192\n  shell:\n"
+        "    timeout: 900\n    max_timeout: 7200\n    kill_grace: 0\n"
+        "agent:\n  max_tool_rounds: 24\n  max_tool_calls: 80\n  max_context_chars: 100000\n"
+    ))
+    profile = cfg.get_profile("default")
+    router, agent = build_session(cfg, profile, ProviderChain(profile.chain()), mode=None, dry_run=False)
+    assert router.ctx.shell_timeout == 900
+    assert router.ctx.shell_max_timeout == 7200
+    assert router.ctx.shell_kill_grace == 0
+    assert router.ctx.max_output_chars == 8192
+    assert agent.max_rounds == 24
+    assert agent.max_tool_calls == 80
+    assert agent.max_context_chars == 100000
+
+
+def test_existing_long_timeout_config_gets_a_compatible_ceiling(write_config):
+    cfg = load_config(write_config(
+        "provider:\n  base_url: https://example.test/v1\n  model: m\n"
+        "tools:\n  shell:\n    timeout: 7200\n"
+    ))
+    assert cfg.tools.shell_max_timeout == 7200

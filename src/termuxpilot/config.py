@@ -22,6 +22,7 @@ Precedence (highest wins): CLI flags > selected profile > top-level defaults.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field, replace
@@ -136,6 +137,9 @@ class ToolsConfig:
     mode: str = "standard"  # session permission mode (safe|standard|yolo)
     shell_timeout: float = 60.0
     shell_workdir: str | None = None
+    shell_max_timeout: float = 3600.0
+    shell_kill_grace: float = 1.0
+    max_output_chars: int = 30_000
     protected_paths: tuple[str, ...] = DEFAULT_PROTECTED_PATHS
     blocklist: list[str] = field(default_factory=list)
     allowlist: list[str] = field(default_factory=list)
@@ -146,6 +150,8 @@ class ToolsConfig:
 @dataclass
 class AgentConfig:
     max_tool_rounds: int = 8
+    max_tool_calls: int = 32
+    max_context_chars: int = 200_000
     function_calling: str = "auto"  # auto | native | json
 
 
@@ -159,8 +165,29 @@ def _parse_tools_config(doc: dict, path: Path) -> tuple[ToolsConfig, AgentConfig
         raise ConfigError(f"tools.mode must be one of {TOOL_MODES}, got {mode!r}")
 
     shell_timeout = sblock.get("timeout", 60.0)
-    if not isinstance(shell_timeout, (int, float)) or shell_timeout <= 0:
-        raise ConfigError("tools.shell.timeout must be a positive number of seconds")
+
+    def seconds(value: Any, key: str, *, allow_zero: bool = False) -> float:
+        try:
+            valid = type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            valid = False
+        if not valid or value < 0 or (value == 0 and not allow_zero):
+            qualifier = "non-negative" if allow_zero else "positive"
+            raise ConfigError(f"{key} must be a finite {qualifier} number of seconds")
+        return float(value)
+
+    shell_timeout = seconds(shell_timeout, "tools.shell.timeout")
+    shell_max_timeout = seconds(
+        sblock.get("max_timeout", max(3600.0, shell_timeout)), "tools.shell.max_timeout",
+    )
+    if shell_max_timeout < shell_timeout:
+        raise ConfigError("tools.shell.max_timeout must be >= tools.shell.timeout")
+    shell_kill_grace = seconds(sblock.get("kill_grace", 1.0), "tools.shell.kill_grace", allow_zero=True)
+    if shell_kill_grace > 30:
+        raise ConfigError("tools.shell.kill_grace must be <= 30 seconds")
+    max_output_chars = tblock.get("max_output_chars", 30_000)
+    if type(max_output_chars) is not int or not 128 <= max_output_chars <= 1_000_000:
+        raise ConfigError("tools.max_output_chars must be an integer between 128 and 1000000")
 
     protected = fblock.get("protected_paths")
     if protected is not None:
@@ -189,7 +216,10 @@ def _parse_tools_config(doc: dict, path: Path) -> tuple[ToolsConfig, AgentConfig
 
     tools = ToolsConfig(
         mode=mode,
-        shell_timeout=float(shell_timeout),
+        shell_timeout=shell_timeout,
+        shell_max_timeout=shell_max_timeout,
+        shell_kill_grace=shell_kill_grace,
+        max_output_chars=max_output_chars,
         shell_workdir=workdir,
         protected_paths=protected_paths,
         blocklist=_rules("blocklist"),
@@ -200,12 +230,20 @@ def _parse_tools_config(doc: dict, path: Path) -> tuple[ToolsConfig, AgentConfig
 
     ablock = _as_dict(doc.get("agent"), "agent")
     max_rounds = ablock.get("max_tool_rounds", 8)
-    if not isinstance(max_rounds, int) or max_rounds < 1:
+    if type(max_rounds) is not int or max_rounds < 1:
         raise ConfigError("agent.max_tool_rounds must be a positive integer")
     fc = str(ablock.get("function_calling") or "auto").lower()
     if fc not in FUNCTION_CALLING_MODES:
         raise ConfigError(f"agent.function_calling must be one of {FUNCTION_CALLING_MODES}")
-    agent = AgentConfig(max_tool_rounds=max_rounds, function_calling=fc)
+    max_calls = ablock.get("max_tool_calls", 32)
+    max_context = ablock.get("max_context_chars", 200_000)
+    for key, value in (("max_tool_calls", max_calls), ("max_context_chars", max_context)):
+        if type(value) is not int or value < 1:
+            raise ConfigError(f"agent.{key} must be a positive integer")
+    agent = AgentConfig(
+        max_tool_rounds=max_rounds, function_calling=fc,
+        max_tool_calls=max_calls, max_context_chars=max_context,
+    )
     return tools, agent
 
 
@@ -537,20 +575,25 @@ default_profile: cloud
 # Tools & agent (v0.2) ------------------------------------------------------
 tools:
   mode: standard            # safe = read-only | standard = confirm writes | yolo = auto
-  redact_secrets: true      # mask API keys/tokens in command output before it reaches the model
+  redact_secrets: true      # mask tool outputs, previews, and errors
+  max_output_chars: 30000   # bounded head/tail output per result (128..1000000)
   dry_run: false            # true = show what WOULD run; nothing is executed
   # blocklist:               # regexes — matching commands are denied in ANY mode
   #   - "rm\\s+-rf\\s+/"
   #   - "mkfs"
   # allowlist: []            # if non-empty, ONLY matching commands may run
   shell:
-    timeout: 60             # seconds per command
+    timeout: 60             # default seconds per foreground command
+    max_timeout: 3600       # model requests cannot exceed this ceiling
+    kill_grace: 1           # seconds between TERM and KILL (0..30)
     # workdir: "~"
   files:
     # protected_paths: ["/etc", "/dev", "/boot", "/system", "/vendor"]
 
 agent:
-  max_tool_rounds: 8        # tool calls per user message before we stop
+  max_tool_rounds: 8        # model/tool rounds per user message
+  max_tool_calls: 32        # total attempted tool calls, including batches
+  max_context_chars: 200000 # messages + tool schemas; a size guard, NOT a token count
   function_calling: auto    # auto = native, degrade to JSON mode if unsupported
                             # native = require function calling | json = always JSON mode
 

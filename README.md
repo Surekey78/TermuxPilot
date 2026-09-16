@@ -4,7 +4,7 @@ A **CLI-first autonomous AI agent that runs natively in Termux on Android**.
 It chats with *any* OpenAI-compatible endpoint (OpenAI, Groq, OpenRouter,
 Together, DeepSeek, Ollama, llama.cpp server, LM Studio over LAN, …), streams
 answers to your terminal, and — as versions land — controls the device, runs
-shell commands through a sandboxed tool layer, manages files, and automates
+shell commands through a permission-gated tool layer, manages files, and automates
 workflows.
 
 No hardcoded provider: all model access goes through one
@@ -154,12 +154,20 @@ tp config show [--config-path P]         # show the resolved config (keys masked
 tp --model gpt-4o --base-url https://api.openai.com/v1 "..."   # per-run overrides
 ```
 
-Exit codes: `0` success · `1` provider failure (all chain links exhausted) ·
-`2` config/usage error.
+One-shot exit codes: `0` final answer returned · `1` provider failure ·
+`2` config/usage error · **`3` incomplete (limit reached, empty or interrupted
+provider response)** · `130` user interruption. A final answer is not an
+independent verification that every requested operation succeeded; inspect
+individual tool results too.
 
 The agent answers through a **tool loop**: it calls tools, sees their
 (redacted) output, and continues until it has a final answer
-(`agent.max_tool_rounds` caps the loop).
+(`agent.max_tool_rounds` caps the loop). Total tool attempts and message size
+also have independent limits. `--json` reports `status`, `truncated`, and
+`stop_reason`; reaching a limit is **never** reported as `ok: true`.
+Completed tool results are kept in the current REPL session if a later provider
+call fails, so the next turn can inspect what already happened rather than
+blindly repeat it. This is in-memory progress, not restart recovery.
 
 ### REPL commands
 
@@ -215,10 +223,10 @@ execution behind the agent's back. In v0.2:
 
 | Tool | Category | What it does |
 |---|---|---|
-| `run_shell` | execute | run a command (Termux home cwd), returns exit code + redacted output |
-| `read_file` | read | numbered lines, optional line window |
-| `write_file` | write | create/overwrite, unified-diff preview before applying |
-| `edit_file` | write | exact unique search/replace, diff preview |
+| `run_shell` | execute | bounded foreground command, process-group cleanup, exit code + redacted output (configured cwd, otherwise CLI cwd) |
+| `read_file` | read | bounded numbered line windows, including files larger than 1 MB |
+| `write_file` | write | create/overwrite up to 1 MB UTF-8, diff preview + atomic replacement |
+| `edit_file` | write | exact unique search/replace, diff preview + atomic replacement |
 | `move_file` | write | move/rename, refuses overwrite without `overwrite: true` |
 | `diff_files` | read | unified diff between two files |
 
@@ -226,9 +234,19 @@ execution behind the agent's back. In v0.2:
 
 | Mode | read tools | write/execute tools |
 |---|---|---|
-| `safe` | allowed | **denied** (read-only session) |
-| `standard` | allowed | read-only commands auto-run; anything mutating shows a **dry-run preview + y/N confirmation** |
+| `safe` | allowed | only a conservative subset of inspection commands; other execution and all writes **denied** |
+| `standard` | allowed | vetted inspection commands auto-run; unknown or mutating commands require **preview + y/N confirmation** |
 | `yolo` | allowed | executed automatically (blocklist still applies) |
+
+**Permission policy, not an OS sandbox:** binaries on `PATH` and installed tools
+must be trusted. Automatic shell execution is limited to simple commands such
+as `ls`, `cat`, `head`, `grep`, `df`, and pipelines/`&&` combinations of those
+commands. Interpreters, `git` (which can invoke configured helpers), `find`,
+`awk`, `sed`, unknown commands, substitutions, redirects, and glob expansion
+require approval in standard mode and are denied in safe mode. Conservative
+false positives, including quoted metacharacters, also require approval.
+`yolo` is an explicit opt-out from confirmation, not isolation. Regex
+allowlists do not override safe-mode restrictions and are not shell parsers.
 
 Additional safety:
 
@@ -238,20 +256,124 @@ Additional safety:
 * **config blocklist/allowlist** (regexes): the blocklist denies in *any*
   mode; a non-empty allowlist restricts what may run at all;
 * **protected paths** (`/etc`, `/dev`, `/boot`, `/system`, `/vendor`, …)
-  escalate file-tool risk to high;
+  escalate file-tool risk to high after resolving relative paths, `..`, and symlinks;
 * **secret redaction** masks API keys (OpenAI/GitHub/AWS/Groq/Google/JWT/
-  Bearer/`key=value`), private-key blocks, etc. in command output *before*
-  it reaches the model;
+  Bearer/`key=value`), private-key blocks, etc. in tool outputs, file diffs,
+  previews, errors, and recorded arguments. Shell streams are sanitized before
+  bounded retention; private-key state is tracked across lines. This is
+  best-effort recognition, not a guarantee of detecting every secret. Avoid
+  exposing sensitive files unnecessarily. Audit arguments are always redacted,
+  even when model/UI redaction is explicitly disabled;
 * **audit log**: every tool decision/execution is appended to
   `~/.termuxpilot/audit.jsonl` (JSON lines) — view with `/audit`;
 * **dry-run** (`tools.dry_run`, `--dry-run`, `/dry-run on`): tool calls are
-  previewed and reported but never executed.
+  previewed without execution approval and never applied (blocklists still
+  win); read-only file inspections may still run;
+* **argument validation**: required fields, built-in parameter types, bounds,
+  and unknown fields are checked before previews; booleans/NaN/infinity cannot
+  masquerade as valid numeric timeouts;
+* **file writes** use a same-directory temporary file and atomic replacement,
+  preserve existing permission bits where supported, and reject detected
+  changes since the preview. Failed writes leave the original intact. This is
+  not a multi-file transaction or a lock against arbitrary concurrent writers.
 
 **Function calling:** `agent.function_calling: auto` (default) sends native
 `tools` payloads and, if the endpoint rejects them with HTTP 400, degrades
 to JSON-mode prompting (strict `{"thought","tool","args","response"}`
-contract + strict parsing) for the rest of the session. Use `native` to
+contract + argument validation; plain-text final answers are tolerated for
+endpoints that ignore `response_format`) for the rest of the session. Use `native` to
 require it or `json` to always use JSON mode.
+
+---
+
+## Long-running and heavy tasks
+
+The execution layer now keeps noisy commands from accumulating all stdout and
+stderr in RAM. Both pipes are drained concurrently into bounded, UTF-8-decoded
+head/tail buffers. Lines longer than 64 Ki characters are omitted as whole lines
+rather than exposing partial secrets. No full command log is written to disk.
+Tool results expose `truncated` and `timed_out` when applicable; JSON tool-call
+summaries retain at most 500 characters, also with a truncation indicator.
+
+Commands run in their own POSIX process group with stdin closed. Use
+non-interactive flags for package/build tools. Timeouts and Ctrl+C send TERM,
+then KILL after a configurable grace period, retaining captured partial output.
+Unmanaged background descendants are cleaned up on normal completion too.
+**Do not use `run_shell` to launch a daemon.** Deliberately detached descendants
+and an Android/OS kill of TermuxPilot are outside this cleanup guarantee.
+
+### Runtime limits
+
+Defaults (merge these blocks into your existing provider configuration):
+
+```yaml
+tools:
+  mode: standard
+  redact_secrets: true
+  max_output_chars: 30000   # per result, including truncation notes; 128..1000000
+  shell:
+    timeout: 60            # default per command, seconds
+    max_timeout: 3600      # model-supplied timeout cannot exceed this ceiling
+    kill_grace: 1          # TERM grace period, 0..30 seconds
+    # workdir: "~/project"
+
+agent:
+  max_tool_rounds: 8       # model/tool rounds per user turn
+  max_tool_calls: 32       # attempts across ALL rounds, including batches/denials
+  max_context_chars: 200000 # messages + reserved tool schemas, NOT a token count
+  function_calling: auto
+```
+
+For a trusted long build, raise `tools.shell.timeout` (for example, to `900`)
+and explicitly configure a sufficient `max_timeout`. If `max_timeout` is
+omitted, it defaults to the larger of 3600 and the configured default timeout,
+so existing long-timeout configurations remain usable. For multi-step work,
+raise the round/call budgets deliberately rather than disabling limits.
+
+A batch that would exceed the remaining call budget is rejected **before any
+of its tools execute**. Context overflow stops cleanly rather than silently
+dropping messages or sending an oversized request. Use smaller reads or
+`/reset` as appropriate. This character guard is not a tokenizer, does not
+compact history, and cannot guarantee that a particular model's context window
+will fit. Usage totals sum counters actually reported across model rounds;
+missing provider usage and unreported failed attempts are not estimated.
+
+`tp config show` and REPL `/config` display these limits. Example incomplete
+JSON result (additional tool/model fields omitted here):
+
+```json
+{"ok": false, "status": "incomplete", "truncated": true,
+ "stop_reason": "max_tool_rounds", "rounds": 8}
+```
+
+### Large files
+
+- Files over 1 MB require `start_line` and/or `end_line`; they are no longer
+  rejected just because the **file** is large when a window was requested.
+- `start_line` without `end_line` reads up to 200 lines. Each window selects at
+  most 1 MB and 10,000 lines. Continuation hints identify byte-limit stops.
+- `read_file` rejects lines over 64 KiB and non-regular files (including
+  FIFOs/devices). Edit/diff previews also reject non-regular files. Reads scan
+  to the requested line with bounded memory, not
+  constant-time random access. They do not scan the suffix just to count lines.
+- Edit/diff/write previews remain bounded to 1 MB. For large transformations,
+  use an appropriate streaming command with approval instead of loading the
+  entire file into a model prompt.
+- Piped stdin is capped at 1,000,000 characters; pass a file path for larger
+  input. Non-TTY input cannot supply interactive execution approval.
+
+### What this does not provide yet
+
+These limits bound output retention and request size, **not a child process's
+RAM/CPU use**. Computation still runs on the phone; provider fallback changes
+where inference runs, not where shell commands execute. Real-device thermal,
+battery, and Android lifecycle testing is still necessary.
+
+The next reliability milestone is durable SQLite jobs/checkpoints, resumable
+workflows with reconciliation of uncertain side effects, resource-aware
+scheduling, bounded log artifacts/retention, and optional remote workers.
+There is no `tp task` command, restart recovery, background job service,
+automatic context summarization, or remote executor in this release.
 
 ---
 
@@ -276,7 +398,7 @@ CLI / REPL (argparse + rich + prompt_toolkit)
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
-pytest                                   # 56 tests: config, SSE, client, chain, CLI e2e
+pytest                                   # unit, integration, and bounded-resource regression tests
 python tests/mockserver.py --port 8100   # local OpenAI-compatible server
                                           #   --fail-next N  fail N requests (503)
                                           #   --drop-after N kill the stream mid-way
@@ -285,7 +407,12 @@ python tests/mockserver.py --port 8100   # local OpenAI-compatible server
 
 Tests spin up real (threaded) mock servers on random ports, so the full
 stack — YAML → profiles → chain → SSE → failover → REPL — is covered end to
-end without any real provider.
+end without any real provider. Additional regressions cover multi-megabyte
+stdout/stderr with bounded Python allocation, 1 GB sparse-file windows,
+process-group cancellation, atomic-write failures, permission bypass attempts,
+and a 100-step mocked workflow. These are regression checks, not a claim of
+full on-device performance certification. GitHub Actions runs the suite on
+Python 3.12 and 3.13.
 
 ## Notes for Termux
 
