@@ -293,3 +293,60 @@ def test_config_show(tmp_path):
         assert a.base_url in proc.stdout
     finally:
         a.stop()
+
+
+def test_json_round_limit_is_not_success(tmp_path):
+    server = MockServer(tool_script=[{"tool": "run_shell", "args": {"cmd": "echo checkpoint"}}]).start()
+    try:
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(make_config_text(base_url=server.base_url) + "agent:\n  max_tool_rounds: 1\n")
+        proc = run_tp(["--config-path", str(cfg), "--json", "go"], stdin="")
+        assert proc.returncode == 3, proc.stderr
+        data = json.loads(proc.stdout)
+        assert data["ok"] is False
+        assert data["status"] == "incomplete"
+        assert data["truncated"] is True
+        assert data["stop_reason"] == "max_tool_rounds"
+        assert data["tool_calls"][0]["ok"] is True
+        assert server.state.last_payload["stream"] is False
+    finally:
+        server.stop()
+
+
+def test_plain_round_limit_has_distinct_exit_code(tmp_path):
+    server = MockServer(tool_script=[{"tool": "run_shell", "args": {"cmd": "echo checkpoint"}}]).start()
+    try:
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(make_config_text(base_url=server.base_url) + "agent:\n  max_tool_rounds: 1\n")
+        proc = run_tp(["--config-path", str(cfg), "--plain", "go"], stdin="")
+        assert proc.returncode == 3, proc.stderr
+        assert "maximum number of tool rounds" in proc.stdout
+    finally:
+        server.stop()
+
+
+def test_oversized_stdin_fails_before_provider_call(tmp_path):
+    server = MockServer().start()
+    try:
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(make_config_text(base_url=server.base_url))
+        proc = run_tp(["--config-path", str(cfg), "--json", "summarize"], stdin="x" * 1_000_001)
+        assert proc.returncode == 2
+        data = json.loads(proc.stdout)
+        assert data["ok"] is False and "line windows" in data["error"]
+        assert server.request_count == 0
+    finally:
+        server.stop()
+
+
+def test_context_limit_is_reported_in_json_before_provider_call(tmp_path):
+    server = MockServer().start()
+    try:
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(make_config_text(base_url=server.base_url) + "agent:\n  max_context_chars: 100\n")
+        proc = run_tp(["--config-path", str(cfg), "--json", "go"], stdin="")
+        assert proc.returncode == 3
+        assert json.loads(proc.stdout)["stop_reason"] == "max_context_chars"
+        assert server.request_count == 0
+    finally:
+        server.stop()

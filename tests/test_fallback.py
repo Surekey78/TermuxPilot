@@ -123,3 +123,27 @@ def test_mid_stream_interrupt_does_not_failover():
 def test_chain_requires_providers():
     with pytest.raises(ValueError):
         ProviderChain([])
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt(), RuntimeError("callback failed")])
+def test_client_is_closed_on_non_provider_exception(monkeypatch, failure):
+    from termuxpilot.config import ProviderSettings
+    from termuxpilot.provider import fallback
+
+    closed = []
+
+    class Client:
+        def __init__(self, settings):
+            pass
+
+        def chat(self, *args, **kwargs):
+            raise failure
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(fallback, "OpenAICompatibleClient", Client)
+    chain = ProviderChain([ProviderSettings(label="test", base_url="http://example.test/v1", model="m")])
+    with pytest.raises(type(failure)):
+        chain.chat(MESSAGES)
+    assert closed == [True]

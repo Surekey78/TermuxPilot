@@ -9,7 +9,10 @@ brick a phone.
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 RiskLevel = str  # "low" | "medium" | "high" | "critical"
 
@@ -115,15 +118,48 @@ def assess_command(command: str) -> RiskAssessment:
     return assessment
 
 
+# Deliberately small: interpreters, git (hooks/helpers), find, awk, sed,
+# sort (--output), printf (-v can change PATH), network clients, and unknown
+# executables need approval.
+# This assumes trusted binaries on PATH; it is a permission policy, not an OS
+# sandbox. The risk classifier remains a separate, advisory warning system.
+READ_ONLY_COMMANDS = frozenset({
+    "ls", "cat", "head", "tail", "wc", "pwd", "echo", "grep",
+    "df", "du", "free", "ps", "uname", "whoami", "id", "uptime",
+    "basename", "dirname", "realpath", "termux-battery-status",
+})
+
+
 def is_read_only(command: str) -> bool:
-    """True when the command has no obvious write side-effects."""
-    if WRITE_REDIRECT_RE.search(command):
+    """Allow only simple inspection commands and pipelines of those commands.
+
+    Fail closed on substitutions, redirects, glob expansion, shell escapes,
+    assignments, background jobs, malformed syntax, or unknown programs.
+    False positives (including quoted metacharacters) require confirmation in
+    standard mode; they must never become automatic execution in safe mode.
+    """
+    if not command.strip() or any(c in command for c in "\n\r\x00$`<>\\(){}*?[]!"):
         return False
-    lowered = " " + command.lower() + " "
-    for cmd in WRITE_COMMANDS:
-        if cmd in lowered:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    expect_program = True
+    for token in tokens:
+        if token in {"|", "&&"}:
+            if expect_program:
+                return False
+            expect_program = True
+        elif token and all(c in ";&|" for c in token):
             return False
-    return True
+        elif expect_program:
+            if token not in READ_ONLY_COMMANDS:
+                return False
+            expect_program = False
+    return bool(tokens) and not expect_program
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +187,7 @@ def match_rules(command: str, rules: list[tuple[str, re.Pattern[str]]]) -> list[
 
 _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("private-key-block", re.compile(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S)),
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S)),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b")),
     ("openai-key", re.compile(r"\bsk-(?!ant-)[A-Za-z0-9_-]{20,}\b")),
     ("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
@@ -182,6 +218,58 @@ def redact_secrets(text: str) -> str:
     return text
 
 
+_PRIVATE_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_PRIVATE_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+_SECRET_FIELDS = frozenset({
+    "apikey", "accesstoken", "authtoken", "authorization", "password", "passwd",
+    "secret", "clientsecret", "token", "privatekey", "cookie", "setcookie",
+})
+
+
+def redact_data(value: Any) -> Any:
+    """Redact nested JSON-like values without altering execution arguments."""
+    if isinstance(value, dict):
+        return {
+            (redact_secrets(key) if isinstance(key, str) else key): (
+                "[REDACTED]"
+                if re.sub(r"[^a-z]", "", str(key).lower()) in _SECRET_FIELDS
+                else redact_data(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_data(item) for item in value]
+    if isinstance(value, str):
+        return redact_secrets(value)
+    return value
+
+
+class LineRedactor:
+    """Redact complete lines while remembering multi-line private-key blocks."""
+
+    def __init__(self) -> None:
+        self._in_private_key = False
+
+    def redact(self, text: str) -> str:
+        out: list[str] = []
+        while text:
+            if self._in_private_key:
+                end = _PRIVATE_END.search(text)
+                if end is None:
+                    break
+                text = text[end.end():]
+                self._in_private_key = False
+            start = _PRIVATE_BEGIN.search(text)
+            if start is None:
+                out.append(redact_secrets(text))
+                break
+            out.append(redact_secrets(text[:start.start()]))
+            out.append("[REDACTED:private-key-block]")
+            self._in_private_key = True
+            text = text[start.end():]
+        return "".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Path guards (file tools)
 # ---------------------------------------------------------------------------
@@ -194,9 +282,9 @@ DEFAULT_PROTECTED_PATHS = (
 
 def is_protected_path(path: str, protected: tuple[str, ...] | list[str]) -> str | None:
     """Return the protected prefix *path* falls under, else None."""
-    normalized = path.rstrip("/") or "/"
+    normalized = Path(path).expanduser().resolve()
     for prefix in protected:
-        prefix = prefix.rstrip("/")
-        if normalized == prefix or normalized.startswith(prefix + "/"):
-            return prefix
+        root = Path(prefix).expanduser().resolve()
+        if normalized == root or root in normalized.parents:
+            return prefix.rstrip("/") or "/"
     return None

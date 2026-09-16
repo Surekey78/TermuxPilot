@@ -58,14 +58,14 @@ class ProviderChain:
             try:
                 result = client.chat(messages, **kwargs)
             except ProviderError as exc:
-                client.close()
                 attempts.append((settings.label, str(exc)))
                 exc.attempts = list(attempts)
                 if exc.retryable and index + 1 < len(self.providers):
                     self._announce(settings.label, self.providers[index + 1].label, exc)
                     continue
                 raise
-            client.close()
+            finally:
+                client.close()  # also close on cancellation or callback errors
             result.provider = settings.label
             return result
         raise AssertionError("unreachable")  # pragma: no cover

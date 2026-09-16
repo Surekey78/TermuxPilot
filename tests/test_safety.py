@@ -11,7 +11,7 @@ from termuxpilot.safety import (
 
 
 def test_readonly_commands_low_risk():
-    for cmd in ("ls -la", "cat /etc/hosts", "termux-battery-status", "git status",
+    for cmd in ("ls -la", "cat /etc/hosts", "termux-battery-status",
                 "ps aux", "df -h"):
         risk = assess_command(cmd)
         assert risk.level == "low", (cmd, risk.reasons)

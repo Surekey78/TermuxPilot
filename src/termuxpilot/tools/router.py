@@ -1,39 +1,30 @@
-"""ToolRouter — the single enforcement point between the agent and the tools.
+"""Single permission, sanitization, and audit gate for every tool call.
 
-Permission model (enforced HERE, not inside individual tools):
-
-  mode    read tools        write/execute tools
-  ------  ----------------  ---------------------------------
-  safe    allowed           denied (read-only session)
-  standard allowed          dry-run preview + user confirmation
-  yolo    allowed           executed automatically (still audited; the
-                            config blocklist always wins)
-
-Additional gates, in order:
-  1. tool exists & arguments parse
-  2. shell allowlist (if configured, the command must match)
-  3. shell blocklist (always denies — any mode)
-  4. mode permission (above) — with dry-run mode short-circuiting execution
-  5. confirmation (interactive prompt; non-interactive sessions auto-deny)
-
-Every decision (allowed / denied / dry-run) is appended to the audit log.
+Argument validation and previews happen before execution. Blocklists always
+win; dry-run previews never need execution permission. Only a conservative
+subset of inspection commands auto-runs in safe/standard mode. This policy
+is not an OS sandbox and assumes trusted tools/binaries on the host.
 """
 
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from ..audit import AuditLog
-from ..safety import RiskAssessment, assess_command, compile_rules, is_read_only, match_rules
-from .base import EXECUTE, ExecutionContext, READ, Tool, ToolRequest, ToolResult, WRITE
+from ..safety import (
+    RiskAssessment, assess_command, compile_rules, is_read_only, match_rules,
+    redact_data, redact_secrets,
+)
+from .base import EXECUTE, ExecutionContext, READ, Tool, ToolRequest, ToolResult, truncate_output
 
 MODES = ("safe", "standard", "yolo")
 
 MODE_DESCRIPTIONS = {
-    "safe": "read-only: commands may inspect but never modify the system",
-    "standard": "writes and commands need your confirmation after a preview",
+    "safe": "read tools and a conservative subset of inspection commands only (not an OS sandbox)",
+    "standard": "unknown commands and writes need your confirmation after a preview",
     "yolo": "fully automatic: the agent executes tools without asking (blocklist still applies)",
 }
 
@@ -60,7 +51,7 @@ class ToolRouter:
         allowlist: list[str] | None = None,
         audit: AuditLog | None = None,
         confirm: ConfirmFn | None = None,
-        announce: Callable[[str, str], None] | None = None,
+        announce: Callable[[str], None] | None = None,
         request_hook: Callable[[str, dict, RiskAssessment, str], None] | None = None,
     ) -> None:
         if mode not in MODES:
@@ -73,10 +64,7 @@ class ToolRouter:
         self.audit = audit or AuditLog()
         self.confirm = confirm
         self.announce = announce
-        #: called once per request, after assessment, before any gate/execution
         self.request_hook = request_hook
-
-    # ------------------------------------------------------------------ api
 
     def specs(self) -> list[dict[str, Any]]:
         return [t.openai_spec() for t in self.tools.values()]
@@ -85,178 +73,151 @@ class ToolRouter:
         return list(self.tools)
 
     def execute(self, name: str, raw_args: Any) -> ToolResult:
-        decision = self.decide(name, raw_args)
-        return decision.result
+        return self.decide(name, raw_args).result
+
+    def sanitize(self, value: Any) -> Any:
+        """For UI/model-bound copies only; never change actual tool inputs."""
+        return redact_data(value) if self.ctx.redact_secrets else deepcopy(value)
 
     def decide(self, name: str, raw_args: Any) -> RouterDecision:
         started = time.monotonic()
+        args = raw_args
+
+        def finish(result: ToolResult, reason: str, *, executed: bool = False) -> RouterDecision:
+            return self._finish(name, args, result, reason, executed, started)
+
         tool = self.tools.get(name)
         if tool is None:
-            result = ToolResult(ok=False, denied=True, output=f"unknown tool: {name}")
-            self._audit(name, None, result, reason="unknown tool", duration=time.monotonic() - started)
-            return RouterDecision(False, result, reason="unknown tool")
-
+            return finish(ToolResult(ok=False, denied=True, output=f"unknown tool: {name}"), "unknown tool")
         try:
             args = tool.resolve_args(raw_args)
         except ValueError as exc:
-            result = ToolResult(ok=False, denied=True, output=str(exc))
-            self._audit(name, raw_args, result, reason="bad arguments",
-                        duration=time.monotonic() - started)
-            return RouterDecision(False, result, reason="bad arguments")
+            return finish(ToolResult(ok=False, denied=True, output=str(exc)), "bad arguments")
 
         request = ToolRequest(name=name, args=args)
-        risk, preview = self._assess(tool, request)
+        try:
+            risk, preview = self._assess(tool, request)
+        except Exception as exc:
+            # An unreadable/oversized preview must not crash the entire agent
+            # or turn into an unpreviewed write.
+            return finish(
+                ToolResult(ok=False, denied=True, output=f"cannot preview '{name}': {exc}"),
+                "preview failed",
+            )
+        request.risk = risk
+        display_risk = self._safe_risk(risk)
+        preview = truncate_output(self.sanitize(preview), self.ctx.max_output_chars)
         if self.request_hook is not None:
-            self.request_hook(name, args, risk, preview)
+            self.request_hook(name, self.sanitize(args), display_risk, preview)
 
-        # --- gates ---------------------------------------------------------
-        denial = self._check_lists(request, risk)
+        denial = self._check_lists(request)
         if denial:
-            result = ToolResult(ok=False, denied=True, output=denial, risk=risk)
             why = "blocklist" if "blocklist" in denial else "allowlist"
-            self._audit(name, args, result, reason=why, duration=time.monotonic() - started)
-            return RouterDecision(False, result, reason=why)
-
-        if tool.category == EXECUTE:
-            cmd = str(request.args.get("cmd", ""))
-            readonly = is_read_only(cmd) and risk.score == 0  # risk level "low"
-            gate_reason = None
-            if self.mode == "safe" and not readonly:
-                gate_reason = (
-                    "denied: session is in 'safe' (read-only) mode and this "
-                    "command would modify the system. Ask the user to switch "
-                    "modes (e.g. `/mode standard` or `--mode standard`), or "
-                    "suggest a read-only alternative."
-                )
-            elif self.mode == "standard" and not readonly:
-                if self.confirm is None or not self.confirm(name, preview, risk):
-                    gate_reason = (
-                        "denied: this command needs user confirmation and it was "
-                        "not given (non-interactive session or the user said no). "
-                        "Adapt: explain what you were about to do and why."
-                    )
-                else:
-                    self._announce(f"approved by user: {name}")
-            if gate_reason:
-                result = ToolResult(ok=False, denied=True, output=gate_reason, risk=risk)
-                why = "safe mode" if self.mode == "safe" else "confirmation declined"
-                self._audit(name, args, result, reason=why,
-                            duration=time.monotonic() - started)
-                return RouterDecision(False, result, reason=why)
-        elif tool.category == WRITE:
-            gate_reason = None
-            if self.mode == "safe":
-                gate_reason = (
-                    f"denied: session is in 'safe' (read-only) mode and "
-                    f"'{name}' would modify files. Ask the user to switch modes "
-                    "(e.g. `/mode standard` or `--mode standard`)."
-                )
-            elif self.mode == "standard":
-                if self.confirm is None or not self.confirm(name, preview, risk):
-                    gate_reason = (
-                        f"denied: '{name}' needs user confirmation and it was "
-                        "not given (non-interactive session or the user said no). "
-                        "Adapt: explain what you were about to do and why."
-                    )
-                else:
-                    self._announce(f"approved by user: {name}")
-            if gate_reason:
-                result = ToolResult(ok=False, denied=True, output=gate_reason, risk=risk)
-                why = "safe mode" if self.mode == "safe" else "confirmation declined"
-                self._audit(name, args, result, reason=why,
-                            duration=time.monotonic() - started)
-                return RouterDecision(False, result, reason=why)
+            return finish(ToolResult(ok=False, denied=True, output=denial, risk=risk), why)
 
         if self.ctx.dry_run and tool.category != READ:
-            result = ToolResult(
-                ok=True,
-                output=f"dry-run: would call '{name}' with {args} (nothing was done)",
-                risk=risk,
+            self._announce(f"[dry-run] {name}: {preview.splitlines()[0] if preview else ''}")
+            return finish(
+                ToolResult(ok=True, output=f"dry-run: would call '{name}' with {self.sanitize(args)} "
+                           "(nothing was done)", risk=risk),
+                "dry-run",
             )
-            self._audit(name, args, result, reason="dry-run",
-                        duration=time.monotonic() - started)
-            self._announce(f"[dry-run] {name}: {preview.splitlines()[0]}")
-            return RouterDecision(False, result, reason="dry-run")
 
-        # --- execute ---------------------------------------------------------
+        readonly = tool.category == READ or (
+            tool.category == EXECUTE and name == "run_shell"
+            and is_read_only(args.get("cmd", "")) and risk.score == 0
+        )
+        if not readonly:
+            if self.mode == "safe":
+                return finish(
+                    ToolResult(ok=False, denied=True, risk=risk, output=(
+                        f"denied: '{name}' is not a vetted read-only operation in 'safe' mode. "
+                        "Use read tools, or ask the user to switch to standard mode for approval."
+                    )), "safe mode",
+                )
+            if self.mode == "standard":
+                if self.confirm is None or not self.confirm(name, preview, display_risk):
+                    return finish(
+                        ToolResult(ok=False, denied=True, risk=risk, output=(
+                            f"denied: '{name}' needs user confirmation and it was not given. "
+                            "Explain the proposed operation or use a read-only alternative."
+                        )), "confirmation declined",
+                    )
+                self._announce(f"approved by user: {name}")
+
         try:
             result = tool.handler(request, self.ctx)
-        except Exception as exc:  # noqa: BLE001 - surfaced to the model
+        except KeyboardInterrupt:
+            finish(ToolResult(ok=False, risk=risk, output="interrupted; side effects may be partial"),
+                   "interrupted", executed=True)
+            raise
+        except Exception as exc:
             result = ToolResult(ok=False, output=f"tool '{name}' crashed: {exc!r}", risk=risk)
         if result.risk is None:
             result.risk = risk
-        result.duration = time.monotonic() - started
-        self._audit(name, args, result, reason="executed",
-                    duration=time.monotonic() - started)
-        return RouterDecision(True, result, reason="executed")
-
-    # -------------------------------------------------------------- helpers
+        return finish(result, "executed", executed=True)
 
     def _assess(self, tool: Tool, request: ToolRequest) -> tuple[RiskAssessment, str]:
         if tool.preview is not None:
             risk, preview = tool.preview(request, self.ctx)
         else:
             risk, preview = RiskAssessment(), f"{tool.name} {request.args}"
-        if tool.category == "execute" and request.name == "run_shell":
-            cmd = str(request.args.get("cmd", ""))
+        if tool.category == EXECUTE and request.name == "run_shell":
+            cmd = request.args.get("cmd", "")
             shell_risk = assess_command(cmd)
             if not is_read_only(cmd):
-                shell_risk.escalate("medium", "mutates system state")
+                shell_risk.escalate("medium", "not in the vetted read-only command subset")
             risk.merge(shell_risk)
-            if not preview.strip().startswith("$"):
-                preview = f"$ {cmd}"
         return risk, preview
 
-    def _check_lists(self, request: ToolRequest, risk: RiskAssessment) -> str | None:
+    def _check_lists(self, request: ToolRequest) -> str | None:
         if request.name != "run_shell":
             return None
-        cmd = str(request.args.get("cmd", ""))
+        cmd = request.args.get("cmd", "")
         for raw in match_rules(cmd, self._block_rules):
             return f"denied: command matches blocklist rule {raw!r}"
-        if self._allow_rules:
-            if not match_rules(cmd, self._allow_rules):
-                return (
-                    "denied: command does not match any allowlist rule "
-                    f"({', '.join(repr(r) for r, _ in self._allow_rules)})"
-                )
+        if self._allow_rules and not match_rules(cmd, self._allow_rules):
+            return "denied: command does not match any allowlist rule"
         return None
+
+    def _safe_risk(self, risk: RiskAssessment | None) -> RiskAssessment | None:
+        if risk is None:
+            return None
+        return RiskAssessment(level=risk.level, reasons=self.sanitize(list(risk.reasons)))
 
     def _announce(self, text: str) -> None:
         if self.announce is not None:
-            self.announce(text)
+            self.announce(self.sanitize(text))
 
-    def _audit(
-        self,
-        name: str,
-        args: Any,
-        result: ToolResult,
-        *,
-        reason: str,
-        duration: float,
-    ) -> None:
+    def _finish(
+        self, name: str, args: Any, result: ToolResult, reason: str,
+        executed: bool, started: float,
+    ) -> RouterDecision:
+        # Every exit path, including denials and preview/handler failures, goes
+        # through the same sanitization boundary. Audit redaction is mandatory
+        # even if the user opted out of model/UI output redaction.
+        output = self.sanitize(result.output)
+        result.truncated = result.truncated or len(output) > self.ctx.max_output_chars
+        result.output = truncate_output(output, self.ctx.max_output_chars)
+        result.risk = self._safe_risk(result.risk)
+        result.duration = time.monotonic() - started
         self.audit.record(
-            tool=name,
+            tool=redact_secrets(name),
             args=_redact_args(args),
             mode=self.mode,
             dry_run=self.ctx.dry_run,
-            executed=result.denied is False and not (
-                isinstance(result.output, str) and result.output.startswith("dry-run:")
-            ),
+            executed=executed,
             ok=result.ok,
             denied=result.denied,
             exit_code=result.exit_code,
+            timed_out=result.timed_out,
+            truncated=result.truncated,
             risk=result.risk.level if result.risk else None,
             reason=reason,
-            duration_s=round(duration, 3),
+            duration_s=round(result.duration, 3),
         )
+        return RouterDecision(executed, result, reason=reason)
 
 
 def _redact_args(args: Any) -> Any:
-    """Mask likely secrets in audited arguments (e.g. pasted tokens)."""
-    from ..safety import redact_secrets
-
-    if isinstance(args, dict):
-        return {k: (redact_secrets(str(v)) if isinstance(v, str) else v) for k, v in args.items()}
-    if isinstance(args, str):
-        return redact_secrets(args)
-    return args
+    return redact_data(args)

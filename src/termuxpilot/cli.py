@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,8 @@ from .config import (
 )
 from .provider import ProviderChain, ProviderError
 from .repl import Repl
+
+MAX_STDIN_CHARS = 1_000_000
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +90,9 @@ def build_session(config: AppConfig, profile: Profile, chain: ProviderChain, *,
     t = config.tools
     ctx = ExecutionContext(
         shell_timeout=t.shell_timeout,
+        shell_max_timeout=t.shell_max_timeout,
+        shell_kill_grace=t.shell_kill_grace,
+        max_output_chars=t.max_output_chars,
         shell_workdir=t.shell_workdir,
         redact_secrets=t.redact_secrets,
         protected_paths=t.protected_paths,
@@ -106,6 +112,8 @@ def build_session(config: AppConfig, profile: Profile, chain: ProviderChain, *,
         chain,
         router,
         max_rounds=config.agent.max_tool_rounds,
+        max_tool_calls=config.agent.max_tool_calls,
+        max_context_chars=config.agent.max_context_chars,
         function_calling=config.agent.function_calling,
     )
     return router, agent
@@ -259,6 +267,17 @@ def _config_command(argv: list[str]) -> int:
                       ", ".join(f.label for f in prof.fallbacks) or "-")
     table.add_row("default_profile", config.default_profile)
     table.add_row("system_prompt", "custom" if config.system_prompt else "built-in")
+    for key, value in {
+        "tools.mode": config.tools.mode,
+        "tools.max_output_chars": config.tools.max_output_chars,
+        "tools.shell.timeout": config.tools.shell_timeout,
+        "tools.shell.max_timeout": config.tools.shell_max_timeout,
+        "tools.shell.kill_grace": config.tools.shell_kill_grace,
+        "agent.max_tool_rounds": config.agent.max_tool_rounds,
+        "agent.max_tool_calls": config.agent.max_tool_calls,
+        "agent.max_context_chars": config.agent.max_context_chars,
+    }.items():
+        table.add_row(key, str(value))
     console.print(table)
     return 0
 
@@ -308,7 +327,14 @@ def main(argv: list[str] | None = None) -> int:
     pipe_context: str | None = None
     has_prompt = bool(args.prompt)
     if has_prompt and not sys.stdin.isatty():
-        data = sys.stdin.read()
+        data = sys.stdin.read(MAX_STDIN_CHARS + 1)
+        if len(data) > MAX_STDIN_CHARS:
+            error = "stdin exceeds 1,000,000 characters; pass a file path and use line windows instead"
+            if args.as_json:
+                print(json.dumps({"ok": False, "status": "error", "error": error}))
+            else:
+                print(f"usage error: {error}", file=sys.stderr)
+            return 2
         if data and data.strip():
             pipe_context = data
 
@@ -336,8 +362,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     prompt = " ".join(args.prompt)
-    ok = repl.ask(prompt, pipe_context=pipe_context)
-    return 0 if ok else 1
+    repl.ask(prompt, pipe_context=pipe_context)
+    return repl.last_exit_code
 
 
 def _reload_hook(args: argparse.Namespace, config: AppConfig):
@@ -372,36 +398,44 @@ def _run_json(
         outcome = agent.run(
             config.system_prompt or "",
             history,
-            on_delta=None,  # non-streaming JSON output
+            on_delta=None,
+            stream=False,  # --json promises non-streaming provider requests
         )
+    except KeyboardInterrupt:
+        print(json.dumps({
+            "ok": False, "status": "interrupted",
+            "error": "interrupted; inspect partial side effects before retrying",
+            "tool_calls": _tool_records(agent.last_outcome),
+        }, ensure_ascii=False))
+        return 130
     except ProviderError as exc:
         print(json.dumps({
             "ok": False,
+            "status": "error",
             "error": str(exc),
             "attempts": [
                 {"provider": label, "error": message} for label, message in exc.attempts
             ],
+            "tool_calls": _tool_records(agent.last_outcome),
         }, ensure_ascii=False))
         return 1
     print(json.dumps({
-        "ok": True,
+        "ok": outcome.completed,
+        "status": outcome.status,
+        "truncated": outcome.truncated,
+        "stop_reason": outcome.stop_reason,
         "content": outcome.final_text,
         "model": outcome.model,
         "provider": outcome.provider,
         "rounds": outcome.rounds,
         "usage": outcome.usage,
-        "tool_calls": [
-            {
-                "name": tc.name,
-                "args": tc.args,
-                "ok": tc.ok,
-                "exit_code": tc.exit_code,
-                "output": tc.output,
-            }
-            for tc in outcome.tool_calls
-        ],
+        "tool_calls": _tool_records(outcome),
     }, ensure_ascii=False))
-    return 0
+    return 0 if outcome.completed else 3
+
+
+def _tool_records(outcome) -> list[dict[str, Any]]:
+    return [asdict(record) for record in outcome.tool_calls] if outcome is not None else []
 
 
 if __name__ == "__main__":

@@ -120,6 +120,7 @@ class Repl:
         )
         self.stream = stream
         self.audit = audit or router.audit
+        self.last_exit_code = 0
         self.conversation = Conversation(
             config.system_prompt or DEFAULT_SYSTEM_PROMPT
         )
@@ -352,6 +353,17 @@ class Repl:
         table.add_column("value")
         for key, value in p.masked_dict().items():
             table.add_row(key, str(value) if value not in (None, "") else "-")
+        for key, value in {
+            "tools.mode": self.router.mode,
+            "tools.max_output_chars": self.router.ctx.max_output_chars,
+            "tools.shell.timeout": self.router.ctx.shell_timeout,
+            "tools.shell.max_timeout": self.router.ctx.shell_max_timeout,
+            "tools.shell.kill_grace": self.router.ctx.shell_kill_grace,
+            "agent.max_tool_rounds": self.agent.max_rounds,
+            "agent.max_tool_calls": self.agent.max_tool_calls,
+            "agent.max_context_chars": self.agent.max_context_chars,
+        }.items():
+            table.add_row(key, str(value))
         self.console.print(table)
         if self.profile.fallbacks:
             self._out("[dim]fallback chain:[/dim]")
@@ -365,6 +377,7 @@ class Repl:
 
         Returns True when the assistant produced a final answer.
         """
+        self.last_exit_code = 0
         message = user_text
         if pipe_context:
             message = (
@@ -405,20 +418,33 @@ class Repl:
             )
         except KeyboardInterrupt:
             view.close_round()
-            self._out(" [yellow](interrupted)[/yellow]")
+            self._remember_progress(self.agent.last_outcome)
+            self.last_exit_code = 130
+            self._out(" [yellow](interrupted; inspect partial side effects before retrying)[/yellow]")
             return False
         except ProviderError as exc:
             view.close_round()
+            self._remember_progress(self.agent.last_outcome)
+            self.last_exit_code = 1
             self._show_provider_error(exc)
             return False
 
-        self._last_outcome = outcome
-        self.conversation.extend(outcome.transcript)
-        self.conversation.add_assistant(outcome.final_text)
+        self._remember_progress(outcome)
+        self.last_exit_code = 0 if outcome.completed else 3
         view.close_round()
         view.finish(outcome.final_text)
         self._footer(outcome, start)
-        return True
+        return outcome.completed
+
+    def _remember_progress(self, outcome: AgentOutcome | None) -> None:
+        if outcome is None:
+            return
+        self._last_outcome = outcome
+        self.conversation.extend(outcome.transcript)
+        # A normal final response already appears in the transcript. Only
+        # synthetic stop notices need another assistant message.
+        if outcome.truncated and outcome.final_text:
+            self.conversation.add_assistant(outcome.final_text)
 
     def _footer(self, outcome: AgentOutcome, start: float) -> None:
         elapsed = time.monotonic() - start
@@ -429,9 +455,9 @@ class Repl:
             f"{len(outcome.tool_calls)} tool call(s)",
         ]
         if outcome.usage:
-            tokens = outcome.usage.get("completion_tokens") or outcome.usage.get("total_tokens")
+            tokens = outcome.usage.get("total_tokens") or outcome.usage.get("completion_tokens")
             if tokens:
-                bits.append(f"{tokens} tokens")
+                bits.append(f"{tokens} reported tokens")
         self._out(f"[dim]— {' · '.join(bits)}[/dim]")
 
     def _show_provider_error(self, exc: ProviderError) -> None:
@@ -441,7 +467,7 @@ class Repl:
                 lines.append(f"[dim]  attempted {label}: {message}[/dim]")
         body = "\n".join(lines)
         if self.plain:
-            self._out("PROVIDER ERROR: " + exc)
+            self._out("PROVIDER ERROR: " + str(exc))
         else:
             self.console.print(Panel(body, title="provider error", border_style="red"))
 
@@ -495,6 +521,8 @@ class Repl:
 
     def _confirm(self, name: str, preview: str, risk: RiskAssessment) -> bool:
         """Interactive y/N gate (standard mode).  Non-interactive -> False."""
+        if not sys.stdin.isatty():
+            return False
         try:
             answer = input(
                 f"  [cyan]tp[/cyan] run {name}? [yellow](risk: {risk.level})[/yellow] [y/N] "
