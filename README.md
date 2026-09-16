@@ -17,9 +17,9 @@ No hardcoded provider: all model access goes through one
 
 | Version | Scope | Status |
 |---|---|---|
-| **v0.1** | Project scaffold, config system + profiles, provider layer (SSE streaming, fallback chain), chat REPL (`tp -i`), one-shot + pipe support | ✅ **this release** |
-| v0.2 | Shell tool with `safe`/`standard`/`yolo` permission gates, risk classifier, file ops with diff previews, session audit log | next |
-| v0.3 | Termux:API bridge (clipboard, notifications, battery, …) | planned |
+| **v0.1** | Project scaffold, config system + profiles, provider layer (SSE streaming, fallback chain), chat REPL (`tp -i`), one-shot + pipe support | ✅ |
+| **v0.2** | Tool layer: shell executor + file ops behind a permission-gated tool router (risk classifier, allow/blocklist, dry-run, secret redaction, audit log); agent loop with native function calling + graceful JSON-mode degradation | ✅ **this release** |
+| v0.3 | Termux:API bridge (clipboard, notifications, battery, …) | next |
 | v0.4 | Memory (SQLite + sqlite-vec) + local RAG over `~/notes` | planned |
 | v0.5 | Voice loop, vision input, background agent daemon | planned |
 
@@ -143,9 +143,11 @@ table of configured profiles.
 
 ```bash
 tp "compress all photos in ~/storage/dcim older than 30 days"
-tp -i                                    # interactive chat (rich markdown, streaming)
+tp -i                                    # interactive agent (rich markdown, streaming)
 cat error.log | tp "why is this failing?"   # stdin attached as context
-tp --json "ping"                         # machine-readable one-shot
+tp --json "ping"                         # machine-readable one-shot (incl. tool calls)
+tp --mode safe "check disk usage"        # force a permission mode for this run
+tp --dry-run "reorganize ~/notes"        # preview tool calls; nothing is executed
 tp --list-profiles                       # show profiles (add --plain for scriptable output)
 tp config init [--force]                 # write the sample config
 tp config show [--config-path P]         # show the resolved config (keys masked)
@@ -154,6 +156,10 @@ tp --model gpt-4o --base-url https://api.openai.com/v1 "..."   # per-run overrid
 
 Exit codes: `0` success · `1` provider failure (all chain links exhausted) ·
 `2` config/usage error.
+
+The agent answers through a **tool loop**: it calls tools, sees their
+(redacted) output, and continues until it has a final answer
+(`agent.max_tool_rounds` caps the loop).
 
 ### REPL commands
 
@@ -166,6 +172,10 @@ Exit codes: `0` success · `1` provider failure (all chain links exhausted) ·
 | `/profiles` | table of configured profiles |
 | `/profile <name>` | switch profile live |
 | `/config` | resolved settings for the active profile (key masked) |
+| `/mode [safe\|standard\|yolo]` | show or set the permission mode |
+| `/dry-run [on\|off]` | preview-only: tool calls are shown, never executed |
+| `/tools` | list the available tools |
+| `/audit [n]` | last `n` audited tool calls (default 10) |
 | `/model <name>`, `/base-url <url>` | session-only overrides |
 | `/about` | version + active provider info |
 
@@ -196,9 +206,52 @@ When the chain fails completely, `tp --json` reports every attempt:
 
 Other endpoint quirks handled transparently: servers that reject
 `stream_options` (retried once without it) and servers that answer a
-streaming request with plain JSON. Native `tools` (function calling) payloads
-are passed through when you supply them — the v0.2 tool layer builds on this,
-degrading to strict-JSON prompting on endpoints without tool support.
+streaming request with plain JSON.
+
+### Tool layer & safety (v0.2)
+
+Every capability is a discrete, named **tool** — there is no free-form shell
+execution behind the agent's back. In v0.2:
+
+| Tool | Category | What it does |
+|---|---|---|
+| `run_shell` | execute | run a command (Termux home cwd), returns exit code + redacted output |
+| `read_file` | read | numbered lines, optional line window |
+| `write_file` | write | create/overwrite, unified-diff preview before applying |
+| `edit_file` | write | exact unique search/replace, diff preview |
+| `move_file` | write | move/rename, refuses overwrite without `overwrite: true` |
+| `diff_files` | read | unified diff between two files |
+
+**Permission model** (enforced in the tool router, `tools.mode`):
+
+| Mode | read tools | write/execute tools |
+|---|---|---|
+| `safe` | allowed | **denied** (read-only session) |
+| `standard` | allowed | read-only commands auto-run; anything mutating shows a **dry-run preview + y/N confirmation** |
+| `yolo` | allowed | executed automatically (blocklist still applies) |
+
+Additional safety:
+
+* **risk classifier** flags destructive patterns (`rm -rf /`, `dd of=/dev/…`,
+  `mkfs`, fork bombs, `curl | sh`, `sudo`, redirects into `/etc`, …) with
+  levels low→critical; high/critical get a red warning panel;
+* **config blocklist/allowlist** (regexes): the blocklist denies in *any*
+  mode; a non-empty allowlist restricts what may run at all;
+* **protected paths** (`/etc`, `/dev`, `/boot`, `/system`, `/vendor`, …)
+  escalate file-tool risk to high;
+* **secret redaction** masks API keys (OpenAI/GitHub/AWS/Groq/Google/JWT/
+  Bearer/`key=value`), private-key blocks, etc. in command output *before*
+  it reaches the model;
+* **audit log**: every tool decision/execution is appended to
+  `~/.termuxpilot/audit.jsonl` (JSON lines) — view with `/audit`;
+* **dry-run** (`tools.dry_run`, `--dry-run`, `/dry-run on`): tool calls are
+  previewed and reported but never executed.
+
+**Function calling:** `agent.function_calling: auto` (default) sends native
+`tools` payloads and, if the endpoint rejects them with HTTP 400, degrades
+to JSON-mode prompting (strict `{"thought","tool","args","response"}`
+contract + strict parsing) for the rest of the session. Use `native` to
+require it or `json` to always use JSON mode.
 
 ---
 
@@ -206,18 +259,17 @@ degrading to strict-JSON prompting on endpoints without tool support.
 
 ```
 CLI / REPL (argparse + rich + prompt_toolkit)
-  └─ Agent turn engine (repl.py: Conversation + streaming turn view)
+  └─ Agent loop (agent/core.py)      ReAct rounds: model -> tool call -> result -> ...
+      ├─ ToolRouter (tools/router.py)  permission mode, allow/blocklist, dry-run,
+      │                               confirmation, audit — the single gate
+      ├─ tools: run_shell, read/write/edit/move/diff   (tools/)
+      ├─ safety.py                   risk classifier, redaction, path guards
       └─ Provider layer (provider/)
           ├─ OpenAICompatibleClient  httpx, SSE streaming, tool-call accumulation
           ├─ ProviderChain           ordered fallback with failover hook
           └─ errors                  retryable / non-retryable policy
-      └─ config.py                   YAML + profiles + env expansion (v0.2+: allowlists)
+      └─ config.py                   YAML: profiles + env expansion + tools/agent blocks
 ```
-
-v0.2 adds the **tool layer** (shell executor with `safe`/`standard`/`yolo`
-gates, risk classifier, audit log, secret redaction) behind the same
-`chain.chat(messages, tools=...)` interface — the REPL already renders
-tool-call deltas.
 
 ## Development
 

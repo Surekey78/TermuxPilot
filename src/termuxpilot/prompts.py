@@ -18,10 +18,47 @@ Guidelines:
   suggest the closest workaround.
 """
 
-#: Instructions appended for endpoints without native function calling
-#: (v0.2 tool layer uses this; kept here so the contract is stable).
 JSON_MODE_INSTRUCTIONS = """\
 You must respond with a single JSON object and nothing else — no markdown,
-no commentary. The object has the shape:
-{"thought": "<what you are doing>", "tool": "<tool name or null>", "args": <object or null>}
+no code fences, no commentary. The object has the shape:
+{"thought": "<what you are doing>", "tool": "<tool name or null>",
+ "args": <object of tool arguments or null>, "response": "<final answer or null>"}
+Set "tool" to null when you are done and "response" to your final answer.
 """
+
+
+def tool_instructions(
+    base_prompt: str,
+    mode: str,
+    router,
+    mode_description: str = "",
+) -> str:
+    """Compose the effective system prompt for one agent session.
+
+    ``mode`` is "native" (function calling) or "json" (structured prompting).
+    """
+    lines = [base_prompt.rstrip(), "", "## Tools"]
+    lines.append(
+        "Available tools: "
+        + ", ".join(router.names())
+        + ". Session permission mode: "
+        + (mode_description or router.mode)
+        + "."
+    )
+    if mode == "json":
+        lines.append(JSON_MODE_INSTRUCTIONS)
+    else:
+        lines.append(
+            "Call the provided functions directly when a tool is needed. "
+            "Arguments are passed as a JSON object."
+        )
+    lines += [
+        "Rules:",
+        "- Prefer tools over guessing; never invent command or file output.",
+        "- Inspect before you modify (read_file / run_shell 'ls' first).",
+        "- If a tool call is denied (permission mode or blocklist), adapt: "
+        "explain what you need and suggest the closest read-only alternative.",
+        "- After tool results, continue until the task is done, then give a "
+        "concise final answer (plain text, no tool JSON).",
+    ]
+    return "\n".join(lines)

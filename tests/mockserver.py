@@ -11,6 +11,14 @@ Behaviour knobs:
 * ``--key``           require ``Authorization: Bearer <key>``
 * ``--drop-after N``  kill the TCP connection mid-stream after N tokens
 * ``--json-only``     answer streaming requests with a plain JSON body
+
+Agent-loop scripting (programmatic API, see MockServer):
+* ``tool_script=[{"tool": "run_shell", "args": {...}}, {"text": "Done."}]``
+  — answers the first chat call with that tool call (native format when the
+  request carries ``tools``, JSON-mode object content otherwise) and the next
+  call with the final text (repeated if asked again).
+* ``reject_tools=True`` — 400 when the request contains a ``tools`` key,
+  simulating an endpoint without function-calling support.
 """
 
 from __future__ import annotations
@@ -58,6 +66,10 @@ class _State:
         self.saw_stream_options: bool | None = None
         self.auth_header: str | None = None
         self.last_payload: dict[str, Any] | None = None
+        self.tool_script: list[dict[str, Any]] | None = None
+        self.tool_step = 0
+        self.reject_tools = False
+        self.saw_tools: bool | None = None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -93,11 +105,18 @@ class _Handler(BaseHTTPRequestHandler):
             state.request_count += 1
             state.last_payload = payload
             state.auth_header = self.headers.get("Authorization")
+            state.saw_tools = "tools" in payload
             if state.require_key:
                 expected = f"Bearer {state.require_key}"
                 if self.headers.get("Authorization") != expected:
                     self._json(401, {"error": {"message": "invalid api key"}})
                     return
+            if state.reject_tools and "tools" in payload:
+                self._json(
+                    400,
+                    {"error": {"message": "unknown parameter: tools"}},
+                )
+                return
             if state.fail_next > 0:
                 state.fail_next -= 1
                 self._json(
@@ -110,6 +129,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": {"message": "unknown endpoint"}})
             return
 
+        if state.tool_script is not None:
+            self._scripted_response(payload)
+            return
         if state.json_only:
             self._json(200, self._completion_payload(payload, stream=False))
             return
@@ -117,6 +139,152 @@ class _Handler(BaseHTTPRequestHandler):
             self._stream_response(payload)
         else:
             self._json(200, self._completion_payload(payload, stream=False))
+
+    # ------------------------------------------------ scripted agent loop
+
+    def _next_action(self) -> dict[str, Any]:
+        state = self.state
+        with state.lock:
+            assert state.tool_script is not None
+            if state.tool_step < len(state.tool_script):
+                action = state.tool_script[state.tool_step]
+                state.tool_step += 1
+            else:
+                # settle on the final entry
+                action = state.tool_script[-1]
+            return action
+
+    def _scripted_response(self, payload: dict[str, Any]) -> None:
+        action = self._next_action()
+        native = "tools" in payload
+        if "tool" in action:
+            if native:
+                if payload.get("stream"):
+                    self._stream_tool_call(payload, action)
+                else:
+                    self._json(200, self._tool_call_payload(payload, action))
+            else:
+                content = json.dumps({
+                    "thought": action.get("thought", ""),
+                    "tool": action["tool"],
+                    "args": action.get("args", {}),
+                })
+                self._reply_text(payload, content)
+        else:
+            self._reply_text(payload, action.get("text", "Done."))
+
+    def _reply_text(self, payload: dict[str, Any], text: str) -> None:
+        if payload.get("stream"):
+            model = payload.get("model") or DEFAULT_MODEL
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+            def send_chunk(raw: bytes) -> None:
+                self.wfile.write(f"{len(raw):X}\r\n".encode("ascii") + raw + b"\r\n")
+                self.wfile.flush()
+
+            def send_event(obj: str) -> None:
+                send_chunk(f"data: {obj}\n\n".encode("utf-8"))
+
+            for token in [t + " " for t in text.split(" ")]:
+                send_event(json.dumps({
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{"index": 0,
+                                 "delta": {"content": token},
+                                 "finish_reason": None}],
+                }))
+            send_event(json.dumps({
+                "id": "chatcmpl-mock",
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }))
+            send_event("[DONE]")
+            send_chunk(b"")  # terminating 0-chunk
+        else:
+            self._json(200, {
+                "id": "chatcmpl-mock",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": payload.get("model") or DEFAULT_MODEL,
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": text},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20,
+                          "total_tokens": 30},
+            })
+
+    def _tool_call_payload(self, payload: dict[str, Any], action: dict) -> dict:
+        return {
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": payload.get("model") or DEFAULT_MODEL,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_mock_1",
+                        "type": "function",
+                        "function": {
+                            "name": action["tool"],
+                            "arguments": json.dumps(action.get("args", {})),
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20,
+                      "total_tokens": 30},
+        }
+
+    def _stream_tool_call(self, payload: dict[str, Any], action: dict) -> None:
+        model = payload.get("model") or DEFAULT_MODEL
+        args_json = json.dumps(action.get("args", {}))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        def send_chunk(raw: bytes) -> None:
+            self.wfile.write(f"{len(raw):X}\r\n".encode("ascii") + raw + b"\r\n")
+            self.wfile.flush()
+
+        def send_event(obj: str) -> None:
+            send_chunk(f"data: {obj}\n\n".encode("utf-8"))
+
+        def event(delta: dict, finish: str | None) -> str:
+            return json.dumps({
+                "id": "chatcmpl-mock",
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            })
+
+        send_event(event({
+            "role": "assistant",
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_mock_1",
+                "type": "function",
+                "function": {"name": action["tool"], "arguments": ""},
+            }],
+        }, None))
+        send_event(event({
+            "tool_calls": [{
+                "index": 0,
+                "function": {"arguments": args_json},
+            }],
+        }, None))
+        send_event(event({}, "tool_calls"))
+        send_event("[DONE]")
+        send_chunk(b"")  # terminating 0-chunk
 
     # ---------------------------------------------------------- helpers
 
@@ -221,6 +389,8 @@ class MockServer:
         drop_after: int | None = None,
         json_only: bool = False,
         reply_factory: ReplyFactory | None = None,
+        tool_script: list[dict[str, Any]] | None = None,
+        reject_tools: bool = False,
     ) -> None:
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.state = _State()
@@ -232,6 +402,8 @@ class MockServer:
         self.state.drop_after = drop_after
         self.state.json_only = json_only
         self.state.reply_factory = reply_factory or default_reply
+        self.state.tool_script = tool_script
+        self.state.reject_tools = reject_tools
         self._thread: threading.Thread | None = None
 
     @property

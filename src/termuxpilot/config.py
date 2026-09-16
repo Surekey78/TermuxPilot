@@ -110,6 +110,8 @@ class AppConfig:
     default_profile: str
     system_prompt: str | None = None
     path: Path | None = None
+    tools: "ToolsConfig" = field(default_factory=lambda: ToolsConfig())
+    agent: "AgentConfig" = field(default_factory=lambda: AgentConfig())
 
     def get_profile(self, name: str) -> Profile:
         try:
@@ -117,6 +119,94 @@ class AppConfig:
         except KeyError:
             known = ", ".join(sorted(self.profiles)) or "<none>"
             raise ConfigError(f"unknown profile '{name}'. Known profiles: {known}") from None
+
+
+# ---------------------------------------------------------------------------
+# Tool / agent configuration (v0.2)
+# ---------------------------------------------------------------------------
+
+from .safety import DEFAULT_PROTECTED_PATHS  # noqa: E402  (after dataclasses above)
+
+TOOL_MODES = ("safe", "standard", "yolo")
+FUNCTION_CALLING_MODES = ("auto", "native", "json")
+
+
+@dataclass
+class ToolsConfig:
+    mode: str = "standard"  # session permission mode (safe|standard|yolo)
+    shell_timeout: float = 60.0
+    shell_workdir: str | None = None
+    protected_paths: tuple[str, ...] = DEFAULT_PROTECTED_PATHS
+    blocklist: list[str] = field(default_factory=list)
+    allowlist: list[str] = field(default_factory=list)
+    redact_secrets: bool = True
+    dry_run: bool = False
+
+
+@dataclass
+class AgentConfig:
+    max_tool_rounds: int = 8
+    function_calling: str = "auto"  # auto | native | json
+
+
+def _parse_tools_config(doc: dict, path: Path) -> tuple[ToolsConfig, AgentConfig]:
+    tblock = _as_dict(doc.get("tools"), "tools")
+    sblock = _as_dict(tblock.get("shell"), "tools.shell")
+    fblock = _as_dict(tblock.get("files"), "tools.files")
+
+    mode = str(tblock.get("mode") or "standard").lower()
+    if mode not in TOOL_MODES:
+        raise ConfigError(f"tools.mode must be one of {TOOL_MODES}, got {mode!r}")
+
+    shell_timeout = sblock.get("timeout", 60.0)
+    if not isinstance(shell_timeout, (int, float)) or shell_timeout <= 0:
+        raise ConfigError("tools.shell.timeout must be a positive number of seconds")
+
+    protected = fblock.get("protected_paths")
+    if protected is not None:
+        if not isinstance(protected, list) or not all(isinstance(p, str) for p in protected):
+            raise ConfigError("tools.files.protected_paths must be a list of strings")
+        protected_paths = tuple(protected)
+    else:
+        protected_paths = DEFAULT_PROTECTED_PATHS
+
+    def _rules(key: str) -> list[str]:
+        value = tblock.get(key) or []
+        if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
+            raise ConfigError(f"tools.{key} must be a list of regex strings")
+        return list(value)
+
+    redact = tblock.get("redact_secrets", True)
+    if not isinstance(redact, bool):
+        raise ConfigError("tools.redact_secrets must be a boolean")
+    dry_run = tblock.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        raise ConfigError("tools.dry_run must be a boolean")
+
+    workdir = sblock.get("workdir")
+    if workdir is not None and not isinstance(workdir, str):
+        raise ConfigError("tools.shell.workdir must be a string path")
+
+    tools = ToolsConfig(
+        mode=mode,
+        shell_timeout=float(shell_timeout),
+        shell_workdir=workdir,
+        protected_paths=protected_paths,
+        blocklist=_rules("blocklist"),
+        allowlist=_rules("allowlist"),
+        redact_secrets=bool(redact),
+        dry_run=bool(dry_run),
+    )
+
+    ablock = _as_dict(doc.get("agent"), "agent")
+    max_rounds = ablock.get("max_tool_rounds", 8)
+    if not isinstance(max_rounds, int) or max_rounds < 1:
+        raise ConfigError("agent.max_tool_rounds must be a positive integer")
+    fc = str(ablock.get("function_calling") or "auto").lower()
+    if fc not in FUNCTION_CALLING_MODES:
+        raise ConfigError(f"agent.function_calling must be one of {FUNCTION_CALLING_MODES}")
+    agent = AgentConfig(max_tool_rounds=max_rounds, function_calling=fc)
+    return tools, agent
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +398,8 @@ def _config_from_env(path: Path) -> AppConfig | None:
         profiles={DEFAULT_PROFILE_NAME: Profile(DEFAULT_PROFILE_NAME, provider)},
         default_profile=DEFAULT_PROFILE_NAME,
         path=path,
+        tools=ToolsConfig(),
+        agent=AgentConfig(),
     )
 
 
@@ -375,11 +467,15 @@ def _parse_config(doc: dict, path: Path) -> AppConfig:
     if system_prompt is not None and not isinstance(system_prompt, str):
         raise ConfigError("system_prompt must be a string")
 
+    tools, agent = _parse_tools_config(doc, path)
+
     return AppConfig(
         profiles=profiles,
         default_profile=default_name,
         system_prompt=system_prompt or None,
         path=path,
+        tools=tools,
+        agent=agent,
     )
 
 
@@ -437,6 +533,26 @@ default_profile: cloud
 # Global system prompt (optional — TermuxPilot ships a sensible default).
 # system_prompt: |
 #   You are TermuxPilot, an assistant on my Android phone, running in Termux.
+
+# Tools & agent (v0.2) ------------------------------------------------------
+tools:
+  mode: standard            # safe = read-only | standard = confirm writes | yolo = auto
+  redact_secrets: true      # mask API keys/tokens in command output before it reaches the model
+  dry_run: false            # true = show what WOULD run; nothing is executed
+  # blocklist:               # regexes — matching commands are denied in ANY mode
+  #   - "rm\\s+-rf\\s+/"
+  #   - "mkfs"
+  # allowlist: []            # if non-empty, ONLY matching commands may run
+  shell:
+    timeout: 60             # seconds per command
+    # workdir: "~"
+  files:
+    # protected_paths: ["/etc", "/dev", "/boot", "/system", "/vendor"]
+
+agent:
+  max_tool_rounds: 8        # tool calls per user message before we stop
+  function_calling: auto    # auto = native, degrade to JSON mode if unsupported
+                            # native = require function calling | json = always JSON mode
 
 # Cloud provider (the "default" profile / inheritance base) ----------------
 provider:

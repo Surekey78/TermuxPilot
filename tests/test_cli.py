@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 from conftest import make_config_text
 from mockserver import MockServer
@@ -14,6 +16,11 @@ TP = [sys.executable, "-m", "termuxpilot"]
 def run_tp(args: list[str], *, stdin: str | None = None, env: dict | None = None,
            timeout: int = 30) -> subprocess.CompletedProcess:
     full_env = dict(os.environ)
+    # keep subprocess runs from writing to the developer's real audit log
+    full_env.setdefault(
+        "TERMUXPILOT_AUDIT",
+        os.path.join(tempfile.gettempdir(), "tp_test_audit.jsonl"),
+    )
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -70,7 +77,66 @@ def test_json_output(tmp_path):
         assert data["ok"] is True
         assert data["content"].startswith("Mock reply")
         assert data["provider"] == "default"
-        assert data["finish_reason"] == "stop"
+        assert "rounds" in data
+        assert isinstance(data["tool_calls"], list)
+    finally:
+        server.stop()
+
+
+def test_json_output_with_tool_call(tmp_path):
+    server = MockServer(tool_script=[
+        {"tool": "run_shell", "args": {"cmd": "echo e2e-tool"}},
+        {"text": "Ran the command successfully."},
+    ]).start()
+    try:
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(make_config_text(base_url=server.base_url))
+        proc = run_tp(["--config-path", str(cfg), "--json", "--mode", "yolo", "run it"])
+        assert proc.returncode == 0, proc.stderr
+        data = json.loads(proc.stdout)
+        assert data["ok"] is True
+        assert data["content"] == "Ran the command successfully."
+        assert data["rounds"] == 2
+        assert data["tool_calls"][0]["name"] == "run_shell"
+        assert data["tool_calls"][0]["ok"] is True
+        assert "e2e-tool" in data["tool_calls"][0]["output"]
+    finally:
+        server.stop()
+
+
+def test_dry_run_flag_executes_nothing(tmp_path):
+    server = MockServer(tool_script=[
+        {"tool": "run_shell", "args": {"cmd": "echo x > /tmp/tp_dry_check.txt"}},
+        {"text": "Previewed only."},
+    ]).start()
+    try:
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(make_config_text(base_url=server.base_url))
+        proc = run_tp(["--config-path", str(cfg), "--dry-run", "--mode", "yolo",
+                       "--json", "run it"])
+        assert proc.returncode == 0, proc.stderr
+        data = json.loads(proc.stdout)
+        assert data["tool_calls"][0]["ok"] is True
+        assert data["tool_calls"][0]["output"].startswith("dry-run:")
+        assert not Path("/tmp/tp_dry_check.txt").exists()
+    finally:
+        server.stop()
+
+
+def test_safe_mode_one_shot_denies_writes(tmp_path):
+    server = MockServer(tool_script=[
+        {"tool": "run_shell", "args": {"cmd": "echo x > /tmp/tp_safe_check.txt"}},
+        {"text": "The write was denied; safe mode is read-only."},
+    ]).start()
+    try:
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(make_config_text(base_url=server.base_url))
+        proc = run_tp(["--config-path", str(cfg), "--mode", "safe", "--json", "run it"])
+        assert proc.returncode == 0, proc.stderr
+        data = json.loads(proc.stdout)
+        assert data["tool_calls"][0]["ok"] is False
+        assert "safe" in data["tool_calls"][0]["output"]
+        assert not Path("/tmp/tp_safe_check.txt").exists()
     finally:
         server.stop()
 

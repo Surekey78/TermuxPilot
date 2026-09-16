@@ -67,8 +67,48 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-profiles", action="store_true",
                         help="list configured profiles and exit")
     parser.add_argument("--config-path", help="explicit config file path")
+    parser.add_argument("--mode", choices=("safe", "standard", "yolo"),
+                        help="permission mode (overrides tools.mode from config)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="preview tool calls only; nothing is executed")
     parser.add_argument("--version", action="version", version=f"tp {__version__}")
     return parser
+
+
+def build_session(config: AppConfig, profile: Profile, chain: ProviderChain, *,
+                  mode: str | None, dry_run: bool, confirm=None, announce=None):
+    """ExecutionContext + ToolRouter + AgentLoop for one run."""
+    from .agent import AgentLoop
+    from .audit import AuditLog
+    from .tools import build_default_tools
+    from .tools.base import ExecutionContext
+    from .tools.router import ToolRouter
+
+    t = config.tools
+    ctx = ExecutionContext(
+        shell_timeout=t.shell_timeout,
+        shell_workdir=t.shell_workdir,
+        redact_secrets=t.redact_secrets,
+        protected_paths=t.protected_paths,
+        dry_run=dry_run or t.dry_run,
+    )
+    router = ToolRouter(
+        build_default_tools(),
+        ctx,
+        mode=mode or t.mode,
+        blocklist=t.blocklist,
+        allowlist=t.allowlist,
+        audit=AuditLog(),
+        confirm=confirm,
+        announce=announce,
+    )
+    agent = AgentLoop(
+        chain,
+        router,
+        max_rounds=config.agent.max_tool_rounds,
+        function_calling=config.agent.function_calling,
+    )
+    return router, agent
 
 
 def _config_subparser(name: str, help_text: str) -> argparse.ArgumentParser:
@@ -247,7 +287,23 @@ def main(argv: list[str] | None = None) -> int:
             default_profile=config.default_profile,
             system_prompt=args.system_prompt,
             path=config.path,
+            tools=config.tools,
+            agent=config.agent,
         )
+    def _announce(text: str) -> None:
+        if args.plain:
+            return
+        if args.as_json:
+            print(text, file=sys.stderr)  # keep stdout machine-readable
+        else:
+            console.print(f"[dim]{text}[/dim]")
+
+    router, agent = build_session(
+        config, profile, chain,
+        mode=args.mode, dry_run=args.dry_run,
+        confirm=None,  # the REPL wires its interactive y/N gate
+        announce=_announce,
+    )
 
     pipe_context: str | None = None
     has_prompt = bool(args.prompt)
@@ -259,11 +315,13 @@ def main(argv: list[str] | None = None) -> int:
     interactive = args.interactive or (not has_prompt and sys.stdin.isatty())
 
     if args.as_json:
-        return _run_json(args, config, profile, chain, has_prompt, pipe_context)
+        return _run_json(args, config, profile, chain, router, agent,
+                         has_prompt, pipe_context)
 
-    repl = Repl(config, profile, chain, console=console, plain=args.plain,
-                stream=not args.no_stream,
+    repl = Repl(config, profile, chain, router, agent, console=console,
+                plain=args.plain, stream=not args.no_stream,
                 reload_profile=_reload_hook(args, config))
+    router.confirm = repl._confirm  # interactive y/N gate (standard mode)
     if interactive:
         return repl.run()
 
@@ -294,6 +352,8 @@ def _run_json(
     config: AppConfig,
     profile: Profile,
     chain: ProviderChain,
+    router,
+    agent,
     has_prompt: bool,
     pipe_context: str | None,
 ) -> int:
@@ -307,14 +367,13 @@ def _run_json(
             "Context pasted from stdin:\n```\n"
             f"{pipe_context.strip()}\n```\n\n" + prompt
         )
-    from .prompts import DEFAULT_SYSTEM_PROMPT
-
-    messages = [
-        {"role": "system", "content": config.system_prompt or DEFAULT_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-    ]
+    history = [{"role": "user", "content": prompt}]
     try:
-        result = chain.chat(messages, stream=False)
+        outcome = agent.run(
+            config.system_prompt or "",
+            history,
+            on_delta=None,  # non-streaming JSON output
+        )
     except ProviderError as exc:
         print(json.dumps({
             "ok": False,
@@ -326,14 +385,20 @@ def _run_json(
         return 1
     print(json.dumps({
         "ok": True,
-        "content": result.content,
-        "model": result.model,
-        "provider": result.provider,
-        "finish_reason": result.finish_reason,
-        "usage": result.usage,
+        "content": outcome.final_text,
+        "model": outcome.model,
+        "provider": outcome.provider,
+        "rounds": outcome.rounds,
+        "usage": outcome.usage,
         "tool_calls": [
-            {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-            for tc in result.tool_calls
+            {
+                "name": tc.name,
+                "args": tc.args,
+                "ok": tc.ok,
+                "exit_code": tc.exit_code,
+                "output": tc.output,
+            }
+            for tc in outcome.tool_calls
         ],
     }, ensure_ascii=False))
     return 0

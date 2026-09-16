@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "termuxpilot"
-version = "0.1.0"
+version = "0.2.0"
 description = "CLI-first autonomous AI agent for Termux on Android (OpenAI-compatible providers)"
 readme = "README.md"
 requires-python = ">=3.12"
